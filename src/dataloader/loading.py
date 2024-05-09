@@ -6,7 +6,7 @@ from PIL import Image
 from PIL import ImageFile
 ImageFile.LOAD_TRUNCATED_IMAGES = True  
 import numpy as np
-import dataloader.transforms as trans
+import src.dataloader.transforms as trans
 import pickle
 import pandas as pd
 from typing import Optional, Tuple
