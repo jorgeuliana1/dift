@@ -312,18 +312,18 @@ class SDClassifier:
         self.featurizer = featurizer
         self.shallow_network = shallow_network
 
-    def classify(self, img: Image, category: Optional[str] = None) -> torch.Tensor:
+    def classify(self, img: Image) -> torch.Tensor:
         # Get features from the featurizer
-        features = self.featurizer.forward(img, category=category)
+        features = self.featurizer.forward(img)
         
         # Pass the features through the shallow network to get logits
         logits = self.shallow_network(features)
         
         return logits
     
-    def predict(self, img: Image, category: Optional[str] = None) -> int:
+    def predict(self, img: Image) -> int:
         # Classify to get logits
-        logits = self.classify(img, category)
+        logits = self.classify(img)
         
         # Get probabilities via softmax
         probabilities = F.softmax(logits, dim=-1)
