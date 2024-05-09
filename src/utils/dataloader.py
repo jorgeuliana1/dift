@@ -1,7 +1,7 @@
 from src.dataloader.loading import PadUfes20
 
 # def get_dataset(args, config):
-def get_dataset(dataset_name, dataroot, traindata, testdata)
+def get_dataset(dataset_name, dataroot, traindata, testdata):
     # if config.data.dataset == "PAD-UFES-20":
     if dataset_name == "PAD-UFES-20":
         train_dataset = PadUfes20(
