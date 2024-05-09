@@ -10,6 +10,7 @@ import gc
 import os
 from PIL import Image
 from torchvision.transforms import PILToTensor
+import torch.nn.functional as F
 
 class MyUNet2DConditionModel(UNet2DConditionModel):
     def forward(
@@ -290,3 +291,44 @@ class SDFeaturizer4Eval(SDFeaturizer):
         unet_ft = unet_ft_all['up_ft'][up_ft_index] # ensem, c, h, w
         unet_ft = unet_ft.mean(0, keepdim=True) # 1,c,h,w
         return unet_ft
+    
+# Simple Shallow Neural Network with a couple of fully connected (linear) layers
+class ShallowNetwork(nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int):
+        super(ShallowNetwork, self).__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x):
+        x = x.view(x.size(0), -1)  # Flatten to [batch_size, -1]
+        x = F.relu(self.fc1(x))  # Activation after first layer
+        x = self.fc2(x)  # Output layer (logits)
+        return x
+
+
+# Classifier using SDFeaturizer and ShallowNetwork for classification
+class SDClassifier:
+    def __init__(self, featurizer: SDFeaturizer, shallow_network: ShallowNetwork):
+        self.featurizer = featurizer
+        self.shallow_network = shallow_network
+
+    def classify(self, img: Image, category: Optional[str] = None) -> torch.Tensor:
+        # Get features from the featurizer
+        features = self.featurizer.forward(img, category=category)
+        
+        # Pass the features through the shallow network to get logits
+        logits = self.shallow_network(features)
+        
+        return logits
+    
+    def predict(self, img: Image, category: Optional[str] = None) -> int:
+        # Classify to get logits
+        logits = self.classify(img, category)
+        
+        # Get probabilities via softmax
+        probabilities = F.softmax(logits, dim=-1)
+        
+        # Get the index of the highest probability as the predicted class
+        predicted_class = torch.argmax(probabilities, dim=-1).item()
+        
+        return predicted_class
