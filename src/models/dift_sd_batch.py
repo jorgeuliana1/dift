@@ -1,15 +1,10 @@
 from diffusers import StableDiffusionPipeline
 import torch
-import torch.nn as nn
-import matplotlib.pyplot as plt
 import numpy as np
 from typing import Any, Callable, Dict, List, Optional, Union
 from diffusers.models.unet_2d_condition import UNet2DConditionModel
 from diffusers import DDIMScheduler
 import gc
-import os
-from PIL import Image
-from torchvision.transforms import PILToTensor
 import torch.nn.functional as F
 
 class MyUNet2DConditionModel(UNet2DConditionModel):
@@ -164,7 +159,7 @@ class OneStepSDPipeline(StableDiffusionPipeline):
     @torch.no_grad()
     def __call__(
         self,
-        img_tensor,
+        imgs_tensor,
         t,
         up_ft_indices,
         negative_prompt: Optional[Union[str, List[str]]] = None,
@@ -174,6 +169,9 @@ class OneStepSDPipeline(StableDiffusionPipeline):
         callback_steps: int = 1,
         cross_attention_kwargs: Optional[Dict[str, Any]] = None
     ):
+        # Making adjustments for bigger batches
+        n, ens, c, h, w = imgs_tensor.size()
+        img_tensor = imgs_tensor.view(n * ens, c, h, w)
 
         device = self._execution_device
         latents = self.vae.encode(img_tensor).latent_dist.sample() * self.vae.config.scaling_factor
@@ -185,6 +183,14 @@ class OneStepSDPipeline(StableDiffusionPipeline):
                                up_ft_indices,
                                encoder_hidden_states=prompt_embeds,
                                cross_attention_kwargs=cross_attention_kwargs)
+        
+        # Converting back to original shape
+        features_tensor = unet_output['up_ft'][up_ft_indices[0]]
+        nens, feats, h, w = features_tensor.size()
+        ens = nens // n
+        reshaped_features_tensor = features_tensor.view(n, ens, feats, h, w)
+        unet_output['up_ft'][up_ft_indices[0]] = reshaped_features_tensor
+
         return unet_output
 
 
@@ -200,7 +206,7 @@ class SDFeaturizer:
         onestep_pipe.enable_xformers_memory_efficient_attention()
         null_prompt_embeds = onestep_pipe._encode_prompt(
             prompt=null_prompt,
-            device='cpu',#'cuda',
+            device='cuda',
             num_images_per_prompt=1,
             do_classifier_free_guidance=False) # [1, 77, dim]
 
@@ -210,7 +216,7 @@ class SDFeaturizer:
 
     @torch.no_grad()
     def forward(self,
-                img_tensor,
+                imgs_tensor, # N, C, H, W
                 prompt='',
                 t=261,
                 up_ft_index=1,
@@ -225,110 +231,34 @@ class SDFeaturizer:
         Return:
             unet_ft: a torch tensor in the shape of [1, c, h, w]
         '''
-        img_tensor = img_tensor.repeat(ensemble_size, 1, 1, 1).cuda() # ensem, c, h, w
+        # Creating ensembles
+        # Assuming imgs_tensor is of shape (n, c, h, w)
+        n, c, h, w = imgs_tensor.size()
+        imgs_tensor_repeated = imgs_tensor.unsqueeze(1).repeat(1, ensemble_size, 1, 1, 1)
+        imgs_tensor_reshaped = imgs_tensor_repeated.view(n, ensemble_size, c, h, w)
+        imgs_tensor_reshaped = imgs_tensor_reshaped.cuda()
+        
+        # Todo: Prompt embeds aren't really working for this
         if prompt == self.null_prompt:
             prompt_embeds = self.null_prompt_embeds
         else:
             prompt_embeds = self.pipe._encode_prompt(
                 prompt=prompt,
-                device='cpu',#'cuda',
+                device='cuda',
                 num_images_per_prompt=1,
                 do_classifier_free_guidance=False) # [1, 77, dim]
-        prompt_embeds = prompt_embeds.repeat(ensemble_size, 1, 1)
+        _, h, w = prompt_embeds.size()
+        prompt_embeds = prompt_embeds.repeat(n * ensemble_size, 1, 1)
+        # prompt_embeds = prompt_embeds.view(n, ensemble_size, h, w)
+
+
         unet_ft_all = self.pipe(
-            img_tensor=img_tensor,
+            imgs_tensor=imgs_tensor_reshaped,
             t=t,
             up_ft_indices=[up_ft_index],
             prompt_embeds=prompt_embeds)
-        unet_ft = unet_ft_all['up_ft'][up_ft_index] # ensem, c, h, w
-        unet_ft = unet_ft.mean(0, keepdim=True) # 1,c,h,w
+        
+        unet_ft = unet_ft_all['up_ft'][up_ft_index]  # n, ensem, c, h, w
+        unet_ft = unet_ft.mean(1)  # n, c, h, w
         return unet_ft
 
-
-class SDFeaturizer4Eval(SDFeaturizer):
-    def __init__(self, sd_id='stabilityai/stable-diffusion-2-1', null_prompt='', cat_list=[]):
-        super().__init__(sd_id, null_prompt)
-        with torch.no_grad():
-            cat2prompt_embeds = {}
-            for cat in cat_list:
-                prompt = f"a photo of a {cat}"
-                prompt_embeds = self.pipe._encode_prompt(
-                    prompt=prompt,
-                    device='cpu',#'cuda',
-                    num_images_per_prompt=1,
-                    do_classifier_free_guidance=False) # [1, 77, dim]
-                cat2prompt_embeds[cat] = prompt_embeds
-            self.cat2prompt_embeds = cat2prompt_embeds
-
-        self.pipe.tokenizer = None
-        self.pipe.text_encoder = None
-        gc.collect()
-        torch.cuda.empty_cache()
-
-
-    @torch.no_grad()
-    def forward(self,
-                img,
-                category=None,
-                img_size=[768, 768],
-                t=261,
-                up_ft_index=1,
-                ensemble_size=8):
-        if img_size is not None:
-            img = img.resize(img_size)
-        img_tensor = (PILToTensor()(img) / 255.0 - 0.5) * 2
-        img_tensor = img_tensor.unsqueeze(0).repeat(ensemble_size, 1, 1, 1)#.cuda() # ensem, c, h, w
-        if category in self.cat2prompt_embeds:
-            prompt_embeds = self.cat2prompt_embeds[category]
-        else:
-            prompt_embeds = self.null_prompt_embeds
-        prompt_embeds = prompt_embeds.repeat(ensemble_size, 1, 1)#.cuda()
-        unet_ft_all = self.pipe(
-            img_tensor=img_tensor,
-            t=t,
-            up_ft_indices=[up_ft_index],
-            prompt_embeds=prompt_embeds)
-        unet_ft = unet_ft_all['up_ft'][up_ft_index] # ensem, c, h, w
-        unet_ft = unet_ft.mean(0, keepdim=True) # 1,c,h,w
-        return unet_ft
-    
-# Simple Shallow Neural Network with a couple of fully connected (linear) layers
-class ShallowNetwork(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int):
-        super(ShallowNetwork, self).__init__()
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, output_dim)
-
-    def forward(self, x):
-        x = x.view(x.size(0), -1)  # Flatten to [batch_size, -1]
-        x = F.relu(self.fc1(x))  # Activation after first layer
-        x = self.fc2(x)  # Output layer (logits)
-        return x
-
-
-# Classifier using SDFeaturizer and ShallowNetwork for classification
-class SDClassifier:
-    def __init__(self, featurizer: SDFeaturizer, shallow_network: ShallowNetwork):
-        self.featurizer = featurizer
-        self.shallow_network = shallow_network
-
-    def classify(self, img: Image) -> torch.Tensor:
-        # Get features from the featurizer
-        features = self.featurizer.forward(img)
-        
-        # Pass the features through the shallow network to get logits
-        logits = self.shallow_network(features)
-        
-        return logits
-    
-    def predict(self, img: Image) -> int:
-        # Classify to get logits
-        logits = self.classify(img)
-        
-        # Get probabilities via softmax
-        probabilities = F.softmax(logits, dim=-1)
-        
-        # Get the index of the highest probability as the predicted class
-        predicted_class = torch.argmax(probabilities, dim=-1).item()
-        
-        return predicted_class
